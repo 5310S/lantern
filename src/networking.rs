@@ -106,25 +106,36 @@ pub async fn setup_upnp(listen_addr: &str, port: u16) -> Result<(), String> {
         })
         .ok_or_else(|| "No valid IPv4 address found".to_string())?;
 
+    info!("Selected local IP for UPnP: {}", local_ip);
+
     let addr = listen_addr
         .parse::<SocketAddr>()
         .map_err(|e| format!("Invalid listen address: {}", e))?;
     let addr_v4 = SocketAddrV4::new(local_ip, port);
 
-    let max_retries = 3;
+    let max_retries = 5;
     let mut last_error = None;
 
+    // Try igd crate first
     for attempt in 1..=max_retries {
-        info!("Attempting UPnP setup (attempt {}/{})", attempt, max_retries);
+        info!("Attempting UPnP setup with igd (attempt {}/{}) on port {}", attempt, max_retries, port);
 
         let search_options = SearchOptions {
-            timeout: Some(std::time::Duration::from_secs(10)),
+            timeout: Some(std::time::Duration::from_secs(20)),
             broadcast_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 255, 250)), 1900),
             bind_addr: SocketAddr::new(IpAddr::V4(local_ip), 0),
         };
 
+        info!(
+            "UPnP search options: timeout={:?}, broadcast_address={}, bind_addr={}",
+            search_options.timeout, search_options.broadcast_address, search_options.bind_addr
+        );
+
         let gateway = match igd::search_gateway(search_options) {
-            Ok(gateway) => gateway,
+            Ok(gateway) => {
+                info!("Found gateway: {:?}", gateway);
+                gateway
+            }
             Err(e) => {
                 last_error = Some(format!("Failed to find gateway: {}", e));
                 error!("Gateway search failed on attempt {}: {}", attempt, e);
@@ -136,42 +147,63 @@ pub async fn setup_upnp(listen_addr: &str, port: u16) -> Result<(), String> {
             }
         };
 
-        match gateway.add_port(
-            PortMappingProtocol::TCP,
-            port,
-            addr_v4,
-            86400,
-            "Cuneos Blockchain P2P",
-        ) {
-            Ok(_) => {
-                info!("UPnP port mapping added for {}:{}", local_ip, port);
-                match gateway.get_external_ip() {
-                    Ok(external_ip) => {
-                        info!("Verified UPnP setup: External IP is {}", external_ip);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        last_error = Some(format!("Failed to verify UPnP setup: {}", e));
-                        error!("Verification failed on attempt {}: {}", attempt, e);
-                        if attempt < max_retries {
-                            sleep(std::time::Duration::from_secs(2)).await;
-                            continue;
+        // Try multiple lease durations to avoid router-specific issues
+        for lease_duration in [3600, 0, 7200] {
+            info!("Trying UPnP port mapping with lease duration {}s", lease_duration);
+            match gateway.add_port(
+                PortMappingProtocol::TCP,
+                port,
+                addr_v4,
+                lease_duration,
+                "CuneosP2P",
+            ) {
+                Ok(_) => {
+                    info!("UPnP port mapping added for {}:{}", local_ip, port);
+                    match gateway.get_external_ip() {
+                        Ok(external_ip) => {
+                            info!("Verified UPnP setup: External IP is {}", external_ip);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            last_error = Some(format!("Failed to verify UPnP setup: {}", e));
+                            error!("Verification failed on attempt {}: {}", attempt, e);
+                            if attempt < max_retries {
+                                sleep(std::time::Duration::from_secs(2)).await;
+                                continue;
+                            }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                last_error = Some(format!("Failed to add UPnP port mapping: {}", e));
-                error!("Port mapping failed on attempt {}: {}", attempt, e);
-                if attempt < max_retries {
-                    sleep(std::time::Duration::from_secs(2)).await;
-                    continue;
+                Err(e) => {
+                    last_error = Some(format!("Failed to add UPnP port mapping (lease {}s): {}", lease_duration, e));
+                    error!("Port mapping failed on attempt {} with lease {}s: {}", attempt, lease_duration, e);
+                    if lease_duration == 7200 || attempt == max_retries {
+                        break;
+                    }
                 }
             }
         }
     }
 
-    Err(last_error.unwrap_or_else(|| "Unknown UPnP setup failure".to_string()))
+    // Fallback to miniupnpc
+    info!("Falling back to miniupnpc for UPnP setup");
+    let output = Command::new("upnpc")
+        .args(&["-e", "CuneosP2P", "-r", &port.to_string(), "TCP"])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run miniupnpc: {}", e))?;
+
+    if output.status.success() {
+        info!("UPnP port mapping added via miniupnpc for port {}", port);
+        return Ok(());
+    } else {
+        let error_msg = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "igd failed: {}. miniupnpc failed: {}",
+            last_error.unwrap_or_else(|| "Unknown UPnP setup failure".to_string()),
+            error_msg
+        ))
+    }
 }
 
 pub async fn cleanup_upnp(port: u16) {
@@ -334,39 +366,43 @@ pub async fn setup_firewall(port: u16) -> Result<(), String> {
 
     #[cfg(target_os = "linux")]
     {
+        let mut ufw_error: Option<String> = None;
+    
         let ufw_check = Command::new("ufw")
             .args(&["status"])
             .output()
             .await;
-
+    
         if ufw_check.is_ok() && ufw_check.unwrap().status.success() {
             let ufw_output = run_with_sudo("ufw", &[&format!("allow {}", port)]).await;
             if ufw_output.is_ok() {
                 info!("Firewall rule added for port {} using ufw", port);
                 return Ok(());
+            } else {
+                ufw_error = Some(ufw_output.unwrap_err().to_string());
             }
         }
-
+    
         let iptables_rule = format!("-A INPUT -p tcp --dport {} -j ACCEPT", port);
         let iptables_output = run_with_sudo("iptables", &["-C", "INPUT", "-p", "tcp", "--dport", &port.to_string(), "-j", "ACCEPT"])
             .await;
-
+    
         if iptables_output.is_ok() {
             info!("Firewall rule for port {} already exists in iptables", port);
             return Ok(());
         }
-
+    
         let iptables_add = run_with_sudo("iptables", &["-A", "INPUT", "-p", "tcp", "--dport", &port.to_string(), "-j", "ACCEPT"])
             .await;
-
+    
         if iptables_add.is_ok() {
             info!("Firewall rule added for port {} using iptables", port);
             return Ok(());
         }
-
+    
         return Err(format!(
             "Failed to add firewall rule: ufw error: {}, iptables error: {}",
-            ufw_output.unwrap_err(),
+            ufw_error.unwrap_or_else(|| "ufw not available or failed to check status".to_string()),
             iptables_add.unwrap_err()
         ));
     }

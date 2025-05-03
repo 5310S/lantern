@@ -25,6 +25,7 @@ if-addrs = "0.10"
 yasna = "0.5"
 typenum = "1.16"
 generic-array = "0.14.7"
+libc = "0.2"
 
 [build-dependencies]
 proc-macro2 = "1.0"
