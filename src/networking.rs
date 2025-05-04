@@ -14,7 +14,7 @@ use serde_json;
 use p256::AffinePoint;
 use if_addrs::get_if_addrs;
 use igd::{SearchOptions, PortMappingProtocol};
-use tracing::{info, error};
+use tracing::{info, error, warn};
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use super::blockchain::{Peer, PeerInfo, Transaction, UserData, Block, PendingPool, Balance, BlockHeader};
 use super::cryptography::{generate_certificates, save_certificates, verify_transaction};
@@ -113,10 +113,37 @@ pub async fn setup_upnp(listen_addr: &str, port: u16) -> Result<(), String> {
         .map_err(|e| format!("Invalid listen address: {}", e))?;
     let addr_v4 = SocketAddrV4::new(local_ip, port);
 
+    // Check if miniupnpc is available
+    let miniupnpc_available = Command::new("upnpc")
+        .arg("-v")
+        .output()
+        .await
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+
+    if miniupnpc_available {
+        info!("Attempting UPnP setup with miniupnpc for port {}", port);
+        let output = Command::new("upnpc")
+            .args(&["-e", "CuneosP2P", "-r", &port.to_string(), "TCP"])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run miniupnpc: {}", e))?;
+
+        if output.status.success() {
+            info!("UPnP port mapping added via miniupnpc for port {}", port);
+            return Ok(());
+        } else {
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            warn!("miniupnpc failed: {}. Falling back to igd.", error_msg);
+        }
+    } else {
+        warn!("miniupnpc not found. Please install it (e.g., 'sudo apt install miniupnpc') or configure port {} manually.", port);
+    }
+
+    // Fallback to igd crate
     let max_retries = 5;
     let mut last_error = None;
 
-    // Try igd crate first
     for attempt in 1..=max_retries {
         info!("Attempting UPnP setup with igd (attempt {}/{}) on port {}", attempt, max_retries, port);
 
@@ -147,7 +174,6 @@ pub async fn setup_upnp(listen_addr: &str, port: u16) -> Result<(), String> {
             }
         };
 
-        // Try multiple lease durations to avoid router-specific issues
         for lease_duration in [3600, 0, 7200] {
             info!("Trying UPnP port mapping with lease duration {}s", lease_duration);
             match gateway.add_port(
@@ -185,25 +211,11 @@ pub async fn setup_upnp(listen_addr: &str, port: u16) -> Result<(), String> {
         }
     }
 
-    // Fallback to miniupnpc
-    info!("Falling back to miniupnpc for UPnP setup");
-    let output = Command::new("upnpc")
-        .args(&["-e", "CuneosP2P", "-r", &port.to_string(), "TCP"])
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run miniupnpc: {}", e))?;
-
-    if output.status.success() {
-        info!("UPnP port mapping added via miniupnpc for port {}", port);
-        return Ok(());
-    } else {
-        let error_msg = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "igd failed: {}. miniupnpc failed: {}",
-            last_error.unwrap_or_else(|| "Unknown UPnP setup failure".to_string()),
-            error_msg
-        ))
-    }
+    Err(format!(
+        "UPnP setup failed: {}. Please manually forward port {} on your VPS firewall.",
+        last_error.unwrap_or_else(|| "Unknown UPnP setup failure".to_string()),
+        port
+    ))
 }
 
 pub async fn cleanup_upnp(port: u16) {
@@ -211,6 +223,14 @@ pub async fn cleanup_upnp(port: u16) {
         if let Err(e) = gateway.remove_port(PortMappingProtocol::TCP, port) {
             error!("Failed to remove UPnP port mapping: {}", e);
         }
+    }
+    // Attempt to clean up miniupnpc mapping
+    let output = Command::new("upnpc")
+        .args(&["-d", &port.to_string(), "TCP"])
+        .output()
+        .await;
+    if let Err(e) = output {
+        error!("Failed to remove miniupnpc port mapping: {}", e);
     }
 }
 
@@ -231,10 +251,50 @@ pub async fn setup_firewall(port: u16) -> Result<(), String> {
         }
     }
 
+    // Helper function to check if the port is already open
+    async fn is_port_open(port: u16) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            let output = Command::new("netsh")
+                .args(&["advfirewall", "firewall", "show", "rule", "name=all"])
+                .output()
+                .await;
+            if let Ok(output) = output {
+                String::from_utf8_lossy(&output.stdout).contains(&port.to_string())
+            } else {
+                false
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let output = Command::new("iptables")
+                .args(&["-C", "INPUT", "-p", "tcp", "--dport", &port.to_string(), "-j", "ACCEPT"])
+                .output()
+                .await;
+            output.is_ok()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let output = Command::new("pfctl")
+                .args(&["-s", "rules"])
+                .output()
+                .await;
+            if let Ok(output) = output {
+                String::from_utf8_lossy(&output.stdout).contains(&port.to_string())
+            } else {
+                false
+            }
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+        {
+            false
+        }
+    }
+
     // Helper function to run a command with sudo on Unix-like systems
     async fn run_with_sudo(cmd: &str, args: &[&str]) -> Result<(), String> {
         let mut command = Command::new("sudo");
-        command.arg(cmd).args(args);
+        command.arg("-n").arg(cmd).args(args); // -n for non-interactive
         let output = command
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -251,197 +311,209 @@ pub async fn setup_firewall(port: u16) -> Result<(), String> {
         Ok(())
     }
 
+    // Check if the port is already open
+    if is_port_open(port).await {
+        info!("Firewall rule for port {} already exists", port);
+        return Ok(());
+    }
+
+    // Check if running with elevated privileges
     if !is_elevated().await {
-        error!("Administrative privileges required to set up firewall rules.");
-        return Err(
-            "Please run the application as an administrator (Windows) or with sudo (Linux/macOS).".to_string(),
-        );
-    }
+        info!("Administrative privileges required to set up firewall rules. Attempting to elevate...");
 
-    #[cfg(target_os = "windows")]
-    {
-        // Try triggering a Windows Firewall prompt by binding to the port
-        if let Ok(listener) = TcpListener::bind(format!("0.0.0.0:{}", port)).await {
-            info!("Bound to port {} to trigger firewall prompt", port);
-            drop(listener); // Drop immediately to avoid holding the port
-        } else {
-            error!("Failed to bind to port {} for firewall prompt", port);
-        }
+        #[cfg(target_os = "windows")]
+        {
+            // Attempt to relaunch with elevation using PowerShell
+            let exe_path = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or("cuneos_blockchain.exe".to_string());
+            let ps_command = format!(
+                "Start-Process -FilePath '{}' -Verb RunAs",
+                exe_path
+            );
+            let ps_output = Command::new("powershell")
+                .args(&["-Command", &ps_command])
+                .output()
+                .await;
 
-        // Check for existing rules for port 8080 (not just named Cuneos_P2P_8080)
-        let rule_check = Command::new("netsh")
-            .args(&[
-                "advfirewall",
-                "firewall",
-                "show",
-                "rule",
-                "name=all",
-            ])
-            .output()
-            .await
-            .map_err(|e| format!("Failed to check firewall rules: {}", e))?;
-
-        let rule_output = String::from_utf8_lossy(&rule_check.stdout);
-        if rule_output.contains(&port.to_string()) {
-            info!("Firewall rule for port {} already exists", port);
-            return Ok(());
-        }
-
-        // Try netsh to add port-based rule
-        let rule_name = format!("Cuneos_P2P_{}", port);
-        let netsh_output = Command::new("netsh")
-            .args(&[
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                &format!("name={}", rule_name),
-                "dir=in",
-                "action=allow",
-                "protocol=TCP",
-                &format!("localport={}", port),
-                "profile=any",
-            ])
-            .output()
-            .await
-            .map_err(|e| format!("Failed to execute netsh: {}", e))?;
-
-        if netsh_output.status.success() {
-            info!("Firewall rule added for port {} using netsh", port);
-            return Ok(());
-        }
-
-        // Fallback to PowerShell for port-based rule
-        let ps_command = format!(
-            "New-NetFirewallRule -Name 'Cuneos_P2P_{}' -DisplayName 'Cuneos P2P {}' \
-            -Direction Inbound -Protocol TCP -LocalPort {} -Action Allow",
-            port, port, port
-        );
-        let ps_output = Command::new("powershell")
-            .args(&["-Command", &ps_command])
-            .output()
-            .await
-            .map_err(|e| format!("Failed to execute PowerShell: {}", e))?;
-
-        if ps_output.status.success() {
-            info!("Firewall rule added for port {} using PowerShell", port);
-            return Ok(());
-        }
-
-        // Fallback to adding the executable to allowed apps
-        let exe_path = std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or("cuneos_blockchain.exe".to_string());
-        let netsh_exe_output = Command::new("netsh")
-            .args(&[
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                &format!("name=Cuneos_P2P_Exe_{}", port),
-                "dir=in",
-                "action=allow",
-                &format!("program={}", exe_path),
-                "protocol=TCP",
-                "profile=any",
-            ])
-            .output()
-            .await
-            .map_err(|e| format!("Failed to execute netsh for executable: {}", e))?;
-
-        if netsh_exe_output.status.success() {
-            info!("Firewall rule added for executable {} using netsh", exe_path);
-            return Ok(());
-        }
-
-        // Construct detailed error message
-        let netsh_error = String::from_utf8_lossy(&netsh_output.stderr);
-        let ps_error = String::from_utf8_lossy(&ps_output.stderr);
-        let netsh_exe_error = String::from_utf8_lossy(&netsh_exe_output.stderr);
-        return Err(format!(
-            "Failed to add firewall rule: netsh error: {}, PowerShell error: {}, netsh executable error: {}",
-            netsh_error, ps_error, netsh_exe_error
-        ));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let mut ufw_error: Option<String> = None;
-    
-        let ufw_check = Command::new("ufw")
-            .args(&["status"])
-            .output()
-            .await;
-    
-        if ufw_check.is_ok() && ufw_check.unwrap().status.success() {
-            let ufw_output = run_with_sudo("ufw", &[&format!("allow {}", port)]).await;
-            if ufw_output.is_ok() {
-                info!("Firewall rule added for port {} using ufw", port);
-                return Ok(());
+            if ps_output.is_ok() && ps_output.unwrap().status.success() {
+                info!("Relaunched with elevated privileges");
+                // Exit the current process to avoid duplicate instances
+                std::process::exit(0);
             } else {
-                ufw_error = Some(ufw_output.unwrap_err().to_string());
+                error!("Failed to elevate privileges. Please run as administrator.");
+                return Err("Failed to elevate privileges. Run as administrator.".to_string());
             }
         }
-    
-        let iptables_rule = format!("-A INPUT -p tcp --dport {} -j ACCEPT", port);
-        let iptables_output = run_with_sudo("iptables", &["-C", "INPUT", "-p", "tcp", "--dport", &port.to_string(), "-j", "ACCEPT"])
-            .await;
-    
-        if iptables_output.is_ok() {
-            info!("Firewall rule for port {} already exists in iptables", port);
-            return Ok(());
+
+        #[cfg(unix)]
+        {
+            // Attempt to use sudo non-interactively
+            info!("Attempting to use sudo non-interactively");
+            // Proceed to try sudo-based commands below
         }
-    
-        let iptables_add = run_with_sudo("iptables", &["-A", "INPUT", "-p", "tcp", "--dport", &port.to_string(), "-j", "ACCEPT"])
-            .await;
-    
-        if iptables_add.is_ok() {
-            info!("Firewall rule added for port {} using iptables", port);
-            return Ok(());
-        }
-    
-        return Err(format!(
-            "Failed to add firewall rule: ufw error: {}, iptables error: {}",
-            ufw_error.unwrap_or_else(|| "ufw not available or failed to check status".to_string()),
-            iptables_add.unwrap_err()
-        ));
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        let pf_conf = format!(
-            "pass in on any proto tcp from any to any port {} keep state\n",
-            port
-        );
-        let pf_path = "/tmp/cuneos_p2p_pf.conf";
-        tokio::fs::write(pf_path, pf_conf)
-            .await
-            .map_err(|e| format!("Failed to write pf config: {}", e))?;
+    let max_retries = 3;
+    for attempt in 1..=max_retries {
+        info!("Attempting firewall setup (attempt {}/{}) on port {}", attempt, max_retries, port);
 
-        let pf_check = Command::new("pfctl")
-            .args(&["-s", "rules"])
-            .output()
-            .await;
+        #[cfg(target_os = "windows")]
+        {
+            // Try binding to trigger firewall prompt
+            if let Ok(listener) = TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+                info!("Bound to port {} to trigger firewall prompt", port);
+                drop(listener);
+            }
 
-        if pf_check.is_ok() && String::from_utf8_lossy(&pf_check.unwrap().stdout).contains(&port.to_string()) {
-            info!("Firewall rule for port {} already exists in pf", port);
-            return Ok(());
+            // Use netsh to add port-based rule
+            let rule_name = format!("Cuneos_P2P_{}", port);
+            let netsh_output = Command::new("netsh")
+                .args(&[
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    &format!("name={}", rule_name),
+                    "dir=in",
+                    "action=allow",
+                    "protocol=TCP",
+                    &format!("localport={}", port),
+                    "profile=any",
+                ])
+                .output()
+                .await;
+
+            if netsh_output.is_ok() && netsh_output.unwrap().status.success() {
+                info!("Firewall rule added for port {} using netsh", port);
+                return Ok(());
+            }
+
+            // Fallback to PowerShell
+            let ps_command = format!(
+                "New-NetFirewallRule -Name 'Cuneos_P2P_{}' -DisplayName 'Cuneos P2P {}' \
+                -Direction Inbound -Protocol TCP -LocalPort {} -Action Allow",
+                port, port, port
+            );
+            let ps_output = Command::new("powershell")
+                .args(&["-Command", &ps_command])
+                .output()
+                .await;
+
+            if ps_output.is_ok() && ps_output.unwrap().status.success() {
+                info!("Firewall rule added for port {} using PowerShell", port);
+                return Ok(());
+            }
+
+            if attempt < max_retries {
+                sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+
+            let netsh_error = netsh_output
+                .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+                .unwrap_or("Unknown netsh error".to_string());
+            let ps_error = ps_output
+                .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+                .unwrap_or("Unknown PowerShell error".to_string());
+            return Err(format!(
+                "Failed to add firewall rule after {} attempts: netsh error: {}, PowerShell error: {}",
+                max_retries, netsh_error, ps_error
+            ));
         }
 
-        let pf_output = run_with_sudo("pfctl", &["-f", pf_path, "-e"]).await;
+        #[cfg(target_os = "linux")]
+{
+    let mut ufw_error: Option<String> = None;
 
-        if pf_output.is_ok() {
-            info!("Firewall rule added for port {} using pfctl", port);
-            return Ok(());
+    // Try ufw if available
+    let ufw_check = Command::new("ufw")
+        .args(&["status"])
+        .output()
+        .await;
+
+    match ufw_check {
+        Ok(output) => {
+            if output.status.success() {
+                let ufw_output = run_with_sudo("ufw", &[&format!("allow {}", port)]).await;
+                if ufw_output.is_ok() {
+                    info!("Firewall rule added for port {} using ufw", port);
+                    return Ok(());
+                } else {
+                    ufw_error = Some(ufw_output.unwrap_err().to_string());
+                }
+            } else {
+                ufw_error = Some(String::from_utf8_lossy(&output.stderr).to_string());
+            }
+        }
+        Err(e) => {
+            ufw_error = Some(format!("ufw command failed: {}", e));
+        }
+    };
+
+    // Try iptables
+    let iptables_add = run_with_sudo(
+        "iptables",
+        &["-A", "INPUT", "-p", "tcp", "--dport", &port.to_string(), "-j", "ACCEPT"],
+    )
+    .await;
+
+    if iptables_add.is_ok() {
+        info!("Firewall rule added for port {} using iptables", port);
+        return Ok(());
+    }
+
+    if attempt < max_retries {
+        sleep(Duration::from_secs(2)).await;
+        continue;
+    }
+
+    let iptables_error = iptables_add.unwrap_err();
+    return Err(format!(
+        "Failed to add firewall rule after {} attempts: ufw error: {}, iptables error: {}",
+        max_retries,
+        ufw_error.unwrap_or("ufw not available".to_string()),
+        iptables_error
+    ));
+}
+
+        #[cfg(target_os = "macos")]
+        {
+            let pf_conf = format!(
+                "pass in on any proto tcp from any to any port {} keep state\n",
+                port
+            );
+            let pf_path = "/tmp/cuneos_p2p_pf.conf";
+            tokio::fs::write(pf_path, pf_conf)
+                .await
+                .map_err(|e| format!("Failed to write pf config: {}", e))?;
+
+            let pf_output = run_with_sudo("pfctl", &["-f", pf_path, "-e"]).await;
+
+            if pf_output.is_ok() {
+                info!("Firewall rule added for port {} using pfctl", port);
+                return Ok(());
+            }
+
+            if attempt < max_retries {
+                sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+
+            return Err(format!(
+                "Failed to add firewall rule after {} attempts: pfctl error: {}",
+                max_retries,
+                pf_output.unwrap_err()
+            ));
         }
 
-        return Err(format!("Failed to add firewall rule using pfctl: {}", pf_output.unwrap_err()));
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+        {
+            return Err("Firewall configuration not supported on this platform".to_string());
+        }
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-    {
-        Err("Firewall configuration not supported on this platform".to_string())
-    }
+    Err("Failed to set up firewall rule after all attempts".to_string())
 }
 
 pub async fn cleanup_firewall(port: u16) {
