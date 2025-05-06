@@ -57,7 +57,13 @@ pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
 }
 
 pub async fn start_https_server(blockchain: Arc<Mutex<Blockchain>>) {
-    connect_to_peers(blockchain.clone()).await;
+    let sync_blockchain = blockchain.clone();
+    tokio::spawn(async move {
+        loop {
+            connect_to_peers(sync_blockchain.clone()).await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
     let tls_config = load_tls_config();
     let tls_acceptor = TlsAcceptor::from(SyncArc::new(tls_config));
 
