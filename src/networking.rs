@@ -20,7 +20,7 @@ pub fn start_network(blockchain: Arc<Mutex<Blockchain>>) {
         listen_for_connections(blockchain_clone, peers_clone);
     });
 
-    connect_to_peers(peers);
+    maintain_peer_connections(peers);
 }
 
 fn listen_for_connections(_blockchain: Arc<Mutex<Blockchain>>, peers: SharedPeers) {
@@ -45,37 +45,46 @@ fn get_public_ip() -> Option<IpAddr> {
     ip_str.parse().ok()
 }
 
-fn connect_to_peers(peers: SharedPeers) {
+fn maintain_peer_connections(peers: SharedPeers) {
     let public_ip = get_public_ip().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
 
-    for &peer in PEERS.iter() {
-        if let Some(ip_part) = peer.split(':').next() {
-            if let Ok(peer_ip) = ip_part.parse::<IpAddr>() {
-                if peer_ip == public_ip {
-                    println!("Skipping self-connection to {}", peer);
-                    continue;
+    thread::spawn(move || loop {
+        for &peer in PEERS.iter() {
+            if let Some(ip_part) = peer.split(':').next() {
+                if let Ok(peer_ip) = ip_part.parse::<IpAddr>() {
+                    if peer_ip == public_ip {
+                        println!("Skipping self-connection to {}", peer);
+                        continue;
+                    }
+                }
+            }
+
+            let already_connected = {
+                peers.lock().unwrap().iter().any(|stream| {
+                    stream.peer_addr().map(|addr| addr.to_string() == peer).unwrap_or(false)
+                })
+            };
+
+            if !already_connected {
+                match TcpStream::connect(peer) {
+                    Ok(mut stream) => {
+                        println!("Connected to peer: {}", peer);
+                        let _ = stream.write_all(b"HANDSHAKE\n");
+                        peers.lock().unwrap().push(stream.try_clone().unwrap());
+
+                        let peer_clone = stream.try_clone().unwrap();
+                        thread::spawn(move || handle_connection(peer_clone));
+                    }
+                    Err(e) => eprintln!("Retry: Failed to connect to peer {}: {}", peer, e),
                 }
             }
         }
 
-        match TcpStream::connect(peer) {
-            Ok(mut stream) => {
-                println!("Connected to peer: {}", peer);
-                let _ = stream.write_all(b"HANDSHAKE\n");
-                peers.lock().unwrap().push(stream.try_clone().unwrap());
-
-                let peer_clone = stream.try_clone().unwrap();
-                thread::spawn(move || handle_connection(peer_clone));
-            }
-            Err(e) => eprintln!("Failed to connect to peer {}: {}", peer, e),
-        }
-    }
-
-    let peers_writer = Arc::clone(&peers);
-    thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(10));
-        let peers_guard = peers_writer.lock().unwrap();
-        for peer in peers_guard.iter() {
+
+        let peers_writer = Arc::clone(&peers);
+        let guard = peers_writer.lock().unwrap();
+        for peer in guard.iter() {
             let _ = peer.try_clone().unwrap().write_all(b"PING\n");
         }
     });
