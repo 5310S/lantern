@@ -13,7 +13,8 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::StreamExt;
 use std::convert::Infallible;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use local_ip_address::local_ip;
+use serde_json;
 
 static PEERS: &[&str] = &[
     "https://47.17.52.8:8443",
@@ -29,14 +30,25 @@ pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
     let chain = blockchain.lock().unwrap().get_chain().clone();
     let body = serde_json::to_vec(&chain).unwrap();
 
+    let local_ip = match local_ip() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => {
+            eprintln!("⚠️  Failed to detect local IP. Skipping peer sync.");
+            return;
+        }
+    };
+
     for peer in PEERS {
+        if peer.contains(&local_ip) {
+            println!("🔍 Detected local IP as {} — skipping peer {} (this is me)", local_ip, peer);
+            continue;
+        }
         match client.post(format!("{}/sync", peer)).body(body.clone()).send().await {
             Ok(res) => println!("✅ Synced with {}: {}", peer, res.status()),
-            Err(err) => eprintln!("❌ Failed to sync with {}: {}", peer, err),
+            Err(_) => println!("🔄 {} not available. Will try again later.", peer),
         }
     }
 }
-// Removed to avoid trait conflict with tokio_stream::StreamExt
 
 pub async fn start_https_server(blockchain: Arc<Mutex<Blockchain>>) {
     connect_to_peers(blockchain.clone()).await;
@@ -52,10 +64,7 @@ pub async fn start_https_server(blockchain: Arc<Mutex<Blockchain>>) {
             let tls_acceptor = tls_acceptor.clone();
             async move {
                 match conn {
-                    Ok(tcp) => match tls_acceptor.accept(tcp).await {
-                        Ok(tls) => Ok::<_, std::io::Error>(tls),
-                        Err(e) => Err(e),
-                    },
+                    Ok(tcp) => tls_acceptor.accept(tcp).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
                     Err(e) => Err(e),
                 }
             }
@@ -81,7 +90,6 @@ pub async fn start_https_server(blockchain: Arc<Mutex<Blockchain>>) {
 }
 
 fn load_tls_config() -> ServerConfig {
-    use std::fs;
     use std::path::Path;
 
     if !Path::new("cert.pem").exists() || !Path::new("key.pem").exists() {
