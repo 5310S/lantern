@@ -14,7 +14,10 @@ use tokio_stream::StreamExt;
 use std::convert::Infallible;
 use reqwest::Client;
 use crate::utils::get_current_timestamp;
+use once_cell::sync::OnceCell;
 use serde_json;
+
+static LOCAL_IP: OnceCell<String> = OnceCell::new();
 
 static PEERS: &[&str] = &[
     "https://47.17.52.8:8080",
@@ -22,7 +25,6 @@ static PEERS: &[&str] = &[
 ];
 
 pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
-
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
@@ -31,22 +33,15 @@ pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
     let chain = blockchain.lock().unwrap().get_chain().clone();
     let body = serde_json::to_vec(&chain).unwrap();
 
-    let local_ip = match reqwest::get("https://api.ipify.org").await {
-        Ok(resp) => match resp.text().await {
-            Ok(ip) => {
+    if LOCAL_IP.get().is_none() {
+        if let Ok(resp) = reqwest::get("https://api.ipify.org").await {
+            if let Ok(ip) = resp.text().await {
                 println!("🌐 Detected public IP: {}", ip);
-                ip
-            },
-            Err(_) => {
-                eprintln!("⚠️ Failed to parse public IP.");
-                return;
+                LOCAL_IP.set(ip).ok();
             }
-        },
-        Err(_) => {
-            eprintln!("⚠️ Failed to fetch public IP.");
-            return;
         }
-    };
+    }
+let local_ip = LOCAL_IP.get().cloned().unwrap_or_default();
 
     for peer in PEERS {
         if let Ok(url) = reqwest::Url::parse(peer) {
@@ -59,11 +54,11 @@ pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
         }
         match client.post(format!("{}/sync", peer)).body(body.clone()).send().await {
             Ok(res) => {
-            println!("✅ Synced with {}: {}", peer, res.status());
-            if let Ok(text) = res.text().await {
-                println!("📨 Peer response: {}", text);
-            }
-        },
+                println!("✅ Synced with {}: {}", peer, res.status());
+                if let Ok(text) = res.text().await {
+                    println!("📨 Peer response: {}", text);
+                }
+            },
             Err(_) => println!("🔄 {} not available. Will try again later.", peer),
         }
     }
@@ -85,8 +80,6 @@ pub async fn start_https_server(blockchain: Arc<Mutex<Blockchain>>) {
             }
         });
     }
-    // DEBUG: Add 3 fake blocks here instead of inside the async spawn
-    
 
     let sync_blockchain = blockchain.clone();
     tokio::spawn(async move {
@@ -95,6 +88,7 @@ pub async fn start_https_server(blockchain: Arc<Mutex<Blockchain>>) {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
     });
+
     let tls_config = load_tls_config();
     let tls_acceptor = TlsAcceptor::from(SyncArc::new(tls_config));
 
@@ -133,8 +127,6 @@ pub async fn start_https_server(blockchain: Arc<Mutex<Blockchain>>) {
 }
 
 fn load_tls_config() -> ServerConfig {
-    use crate::utils::get_current_timestamp;
-    use crate::blockchain::Block;
     use std::path::Path;
 
     if !Path::new("cert.pem").exists() || !Path::new("key.pem").exists() {
@@ -172,48 +164,53 @@ async fn handle_https_request(
     if req.method() == Method::POST && req.uri().path() == "/sync" {
         let (parts, body_stream) = req.into_parts();
         let body = hyper::body::to_bytes(body_stream).await.unwrap();
+
         if let Ok(chain) = serde_json::from_slice::<Vec<Block>>(&body) {
-            let chain_len_ok;
-            {
+            let chain_len_ok = {
                 let bc = blockchain.lock().unwrap();
-                chain_len_ok = chain.len() > bc.get_chain().len() && chain.iter().all(|b| b.hash.starts_with("00"));
-            }
-            if chain_len_ok {
-                let mut bc = blockchain.lock().unwrap();
-                bc.storage.blocks = chain;
-            if let Some(addr) = parts.headers.get("host") {
-                println!("✅ Chain replaced via /sync from peer: {}", addr.to_str().unwrap_or("?"));
-            } else {
-                println!("✅ Chain replaced via /sync");
-            }
-        } else {
-            if let Some(addr) = parts.headers.get("host") {
-                println!("ℹ️  Received /sync from peer: {}, but local chain is longer or equal.", addr.to_str().unwrap_or("?"));
-            } else {
-                println!("ℹ️  Received /sync but local chain is longer or equal.");
-            }
-        }
-            let client = Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .unwrap();
-            let chain_data = {
-                let bc = blockchain.lock().unwrap();
-                serde_json::to_vec(&bc.get_chain()).unwrap()
+                chain.len() > bc.get_chain().len() && chain.iter().all(|b| b.hash.starts_with("00"))
             };
-            for peer in PEERS {
-                if let Ok(url) = reqwest::Url::parse(peer) {
-                    if let Some(host) = url.host_str() {
-                        if let Ok(resp) = reqwest::get("https://api.ipify.org").await {
-                            if let Ok(ip) = resp.text().await {
-                                if host == ip { continue; }
+
+            if chain_len_ok {
+                // lock held above, so drop and assign in separate step
+                let new_chain = chain.clone();
+                blockchain.lock().unwrap().storage.blocks = new_chain;
+
+                if let Some(addr) = parts.headers.get("host") {
+                    println!("✅ Chain replaced via /sync from peer: {}", addr.to_str().unwrap_or("?"));
+                } else {
+                    println!("✅ Chain replaced via /sync");
+                }
+
+                let client = Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .build()
+                    .unwrap();
+                let (chain_data, local_ip) = {
+    let bc = blockchain.lock().unwrap();
+    let chain_data = serde_json::to_vec(&bc.get_chain()).unwrap();
+    let local_ip = LOCAL_IP.get().cloned().unwrap_or_default();
+    (chain_data, local_ip)
+};
+                
+                for peer in PEERS {
+                    if let Ok(url) = reqwest::Url::parse(peer) {
+                        if let Some(host) = url.host_str() {
+                            if host == local_ip {
+                                continue;
                             }
                         }
                     }
+                    match client.post(format!("{}/sync", peer)).body(chain_data.clone()).send().await {
+                        Ok(res) => println!("📡 Broadcasted to {}: {}", peer, res.status()),
+                        Err(err) => eprintln!("⚠️  Failed to broadcast to {}: {}", peer, err),
+                    }
                 }
-                match client.post(format!("{}/sync", peer)).body(chain_data.clone()).send().await {
-                    Ok(res) => println!("📡 Broadcasted to {}: {}", peer, res.status()),
-                    Err(err) => eprintln!("⚠️  Failed to broadcast to {}: {}", peer, err),
+            } else {
+                if let Some(addr) = parts.headers.get("host") {
+                    println!("ℹ️  Received /sync from peer: {}, but local chain is longer or equal.", addr.to_str().unwrap_or("?"));
+                } else {
+                    println!("ℹ️  Received /sync but local chain is longer or equal.");
                 }
             }
             return Ok(Response::new(Body::from("Chain received")));
