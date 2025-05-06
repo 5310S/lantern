@@ -9,7 +9,12 @@ use reqwest;
 
 const PEERS: [&str; 2] = ["47.17.52.8:8080", "82.25.86.57:8080"];
 
-type SharedPeers = Arc<Mutex<Vec<TcpStream>>>;
+struct Peer {
+    addr: String,
+    stream: TcpStream,
+}
+
+type SharedPeers = Arc<Mutex<Vec<Peer>>>;
 
 pub fn start_network(blockchain: Arc<Mutex<Blockchain>>) {
     let peers: SharedPeers = Arc::new(Mutex::new(Vec::new()));
@@ -30,8 +35,9 @@ fn listen_for_connections(_blockchain: Arc<Mutex<Blockchain>>, peers: SharedPeer
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                println!("Accepted connection from: {}", stream.peer_addr().unwrap());
-                peers.lock().unwrap().push(stream.try_clone().unwrap());
+                let addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+                println!("Accepted connection from: {}", addr);
+                peers.lock().unwrap().push(Peer { addr, stream: stream.try_clone().unwrap() });
                 thread::spawn(move || handle_connection(stream));
             }
             Err(e) => eprintln!("Connection failed: {}", e),
@@ -60,9 +66,7 @@ fn maintain_peer_connections(peers: SharedPeers) {
             }
 
             let already_connected = {
-                peers.lock().unwrap().iter().any(|stream| {
-                    stream.peer_addr().map(|addr| addr.to_string() == peer).unwrap_or(false)
-                })
+                peers.lock().unwrap().iter().any(|p| p.addr == peer)
             };
 
             if !already_connected {
@@ -70,7 +74,10 @@ fn maintain_peer_connections(peers: SharedPeers) {
                     Ok(mut stream) => {
                         println!("Connected to peer: {}", peer);
                         let _ = stream.write_all(b"HANDSHAKE\n");
-                        peers.lock().unwrap().push(stream.try_clone().unwrap());
+                        peers.lock().unwrap().push(Peer {
+                            addr: peer.to_string(),
+                            stream: stream.try_clone().unwrap(),
+                        });
 
                         let peer_clone = stream.try_clone().unwrap();
                         thread::spawn(move || handle_connection(peer_clone));
@@ -85,7 +92,7 @@ fn maintain_peer_connections(peers: SharedPeers) {
         let peers_writer = Arc::clone(&peers);
         let guard = peers_writer.lock().unwrap();
         for peer in guard.iter() {
-            let _ = peer.try_clone().unwrap().write_all(b"PING\n");
+            let _ = peer.stream.try_clone().unwrap().write_all(b"PING\n");
         }
     });
 }
