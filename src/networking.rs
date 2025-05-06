@@ -71,22 +71,7 @@ pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
 
 pub async fn start_https_server(blockchain: Arc<Mutex<Blockchain>>) {
     // DEBUG: Add 3 fake blocks here instead of inside the async spawn
-    let fake_blocks = {
-        let mut bc = blockchain.lock().unwrap();
-        let mut last = bc.get_chain().last().unwrap().clone();
-        for i in 1..=3 {
-            let new_block = Block {
-                index: last.index + 1,
-                timestamp: get_current_timestamp(),
-                data: format!("fake block {}", i),
-                previous_hash: last.hash.clone(),
-                hash: format!("fakehash-{}", i),
-                nonce: 0,
-            };
-            bc.storage.blocks.push(new_block.clone());
-            last = new_block;
-        }
-    };
+    
 
     let sync_blockchain = blockchain.clone();
     tokio::spawn(async move {
