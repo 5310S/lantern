@@ -33,7 +33,10 @@ pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
 
     let local_ip = match reqwest::get("https://api.ipify.org").await {
         Ok(resp) => match resp.text().await {
-            Ok(ip) => ip,
+            Ok(ip) => {
+                println!("🌐 Detected public IP: {}", ip);
+                ip
+            },
             Err(_) => {
                 eprintln!("⚠️ Failed to parse public IP.");
                 return;
