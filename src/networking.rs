@@ -176,11 +176,7 @@ async fn handle_https_request(
                 let new_chain = chain.clone();
                 blockchain.lock().unwrap().storage.blocks = new_chain;
 
-                if let Some(addr) = parts.headers.get("host") {
-                    println!("✅ Chain replaced via /sync from peer: {}", addr.to_str().unwrap_or("?"));
-                } else {
-                    println!("✅ Chain replaced via /sync");
-                }
+                println!("ℹ️  Received /sync — no update applied");
 
                 let client = Client::builder()
                     .danger_accept_invalid_certs(true)
