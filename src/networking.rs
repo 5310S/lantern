@@ -30,10 +30,16 @@ pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
     let chain = blockchain.lock().unwrap().get_chain().clone();
     let body = serde_json::to_vec(&chain).unwrap();
 
-    let local_ip = match local_ip() {
-        Ok(ip) => ip.to_string(),
+    let local_ip = match reqwest::get("https://api.ipify.org").await {
+        Ok(resp) => match resp.text().await {
+            Ok(ip) => ip,
+            Err(_) => {
+                eprintln!("⚠️ Failed to parse public IP.");
+                return;
+            }
+        },
         Err(_) => {
-            eprintln!("⚠️  Failed to detect local IP. Skipping peer sync.");
+            eprintln!("⚠️ Failed to fetch public IP.");
             return;
         }
     };
