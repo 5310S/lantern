@@ -1,3 +1,4 @@
+
 use crate::blockchain::{Block, Blockchain};
 use std::sync::{Arc, Mutex};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
@@ -50,7 +51,12 @@ pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
             continue;
         }
         match client.post(format!("{}/sync", peer)).body(body.clone()).send().await {
-            Ok(res) => println!("✅ Synced with {}: {}", peer, res.status()),
+            Ok(res) => {
+            println!("✅ Synced with {}: {}", peer, res.status());
+            if let Ok(text) = res.text().await {
+                println!("📨 Peer response: {}", text);
+            }
+        },
             Err(_) => println!("🔄 {} not available. Will try again later.", peer),
         }
     }
