@@ -1,12 +1,13 @@
 use crate::blockchain::Blockchain;
-use local_ip_address::local_ip;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-const PEERS: [&str; 2] = ["47.17.52.8:8000", "82.25.86.57:8000"];
+use reqwest;
+
+const PEERS: [&str; 2] = ["47.17.52.8:8080", "82.25.86.57:8080"];
 
 type SharedPeers = Arc<Mutex<Vec<TcpStream>>>;
 
@@ -23,8 +24,8 @@ pub fn start_network(blockchain: Arc<Mutex<Blockchain>>) {
 }
 
 fn listen_for_connections(_blockchain: Arc<Mutex<Blockchain>>, peers: SharedPeers) {
-    let listener = TcpListener::bind("0.0.0.0:8000").expect("Failed to bind to port 8000");
-    println!("Listening for connections on port 8000...");
+    let listener = TcpListener::bind("0.0.0.0:8080").expect("Failed to bind to port 8080");
+    println!("Listening for connections on port 8080...");
 
     for stream in listener.incoming() {
         match stream {
@@ -38,13 +39,19 @@ fn listen_for_connections(_blockchain: Arc<Mutex<Blockchain>>, peers: SharedPeer
     }
 }
 
+fn get_public_ip() -> Option<IpAddr> {
+    let response = reqwest::blocking::get("https://api.ipify.org").ok()?;
+    let ip_str = response.text().ok()?;
+    ip_str.parse().ok()
+}
+
 fn connect_to_peers(peers: SharedPeers) {
-    let local_ip = local_ip().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let public_ip = get_public_ip().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
 
     for &peer in PEERS.iter() {
         if let Some(ip_part) = peer.split(':').next() {
             if let Ok(peer_ip) = ip_part.parse::<IpAddr>() {
-                if peer_ip == local_ip {
+                if peer_ip == public_ip {
                     println!("Skipping self-connection to {}", peer);
                     continue;
                 }
