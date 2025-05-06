@@ -222,6 +222,55 @@ async fn handle_https_request(
         }
     }
     match (req.method(), req.uri().path()) {
+        (&Method::GET, "/tip") => {
+            let chain = blockchain.lock().unwrap();
+            let tip = chain.get_chain().last().unwrap();
+            let info = format!("index={}
+hash={}", tip.index, tip.hash);
+            println!("🧱 tip => {}", info);
+            return Ok(Response::new(Body::from(info)));
+        },
+        (&Method::POST, "/block") => {
+            let body = hyper::body::to_bytes(req.into_body()).await.unwrap();
+            if let Ok(block) = serde_json::from_slice::<Block>(&body) {
+                let (last_hash, last_index) = {
+                    let bc = blockchain.lock().unwrap();
+                    let last = bc.get_chain().last().unwrap();
+                    (last.hash.clone(), last.index)
+                };
+                if block.previous_hash == last_hash && block.hash.starts_with("00") {
+                    blockchain.lock().unwrap().storage.blocks.push(block.clone());
+                    println!("✅ Accepted and added new block via /block");
+                    
+                    // broadcast this block to peers
+                    let client = Client::builder()
+                        .danger_accept_invalid_certs(true)
+                        .build()
+                        .unwrap();
+                    let block_json = serde_json::to_vec(&block).unwrap();
+                    let local_ip = LOCAL_IP.get().cloned().unwrap_or_default();
+
+                    for peer in PEERS {
+                        if let Ok(url) = reqwest::Url::parse(peer) {
+                            if let Some(host) = url.host_str() {
+                                if host == local_ip {
+                                    continue;
+                                }
+                            }
+                        }
+                        match client.post(format!("{}/block", peer)).body(block_json.clone()).send().await {
+                            Ok(res) => println!("📡 Block broadcasted to {}: {}", peer, res.status()),
+                            Err(err) => eprintln!("⚠️  Failed to broadcast block to {}: {}", peer, err),
+                        }
+                    }
+                } else {
+                    println!("❌ Rejected /block: invalid linkage or PoW");
+                }
+            } else {
+                println!("❌ Invalid /block payload");
+            }
+            return Ok(Response::new(Body::from("Block received")));
+        }
         (&Method::GET, "/health") => Ok(Response::new(Body::from("OK"))),
         (&Method::GET, "/version") => Ok(Response::new(Body::from("v1.0.0"))),
         (&Method::GET, "/height") => {
