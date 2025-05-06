@@ -17,8 +17,8 @@ use local_ip_address::local_ip;
 use serde_json;
 
 static PEERS: &[&str] = &[
-    "https://47.17.52.8:8443",
-    "https://82.25.86.57:8443"
+    "https://47.17.52.8:8080",
+    "https://82.25.86.57:8080"
 ];
 
 pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
@@ -61,7 +61,7 @@ pub async fn start_https_server(blockchain: Arc<Mutex<Blockchain>>) {
     let tls_config = load_tls_config();
     let tls_acceptor = TlsAcceptor::from(SyncArc::new(tls_config));
 
-    let listener = TcpListener::bind("0.0.0.0:8443")
+    let listener = TcpListener::bind("0.0.0.0:8080")
         .await
         .expect("Failed to bind HTTPS port");
 
@@ -89,7 +89,7 @@ pub async fn start_https_server(blockchain: Arc<Mutex<Blockchain>>) {
     let server = Server::builder(hyper::server::accept::from_stream(incoming))
         .serve(make_service);
 
-    println!("HTTPS server listening on https://0.0.0.0:8443");
+    println!("HTTPS server listening on https://0.0.0.0:8080");
     if let Err(e) = server.await {
         eprintln!("server error: {}", e);
     }
