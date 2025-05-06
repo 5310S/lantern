@@ -15,7 +15,10 @@ use std::convert::Infallible;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-static PEERS: &[&str] = &["https://127.0.0.1:8443"];
+static PEERS: &[&str] = &[
+    "https://47.17.52.8:8443",
+    "https://82.25.86.57:8443"
+];
 
 pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
     let client = Client::builder()
