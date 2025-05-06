@@ -46,9 +46,13 @@ pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
     };
 
     for peer in PEERS {
-        if peer.contains(&local_ip) {
-            println!("🔍 Detected local IP as {} — skipping peer {} (this is me)", local_ip, peer);
-            continue;
+        if let Ok(url) = reqwest::Url::parse(peer) {
+            if let Some(host) = url.host_str() {
+                if host == local_ip {
+                    println!("🔍 Detected public IP as {} — skipping peer {} (this is me)", local_ip, peer);
+                    continue;
+                }
+            }
         }
         match client.post(format!("{}/sync", peer)).body(body.clone()).send().await {
             Ok(res) => {
