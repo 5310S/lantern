@@ -1,5 +1,6 @@
 use crate::blockchain::Block;
 
+#[derive(Clone)]
 pub struct Storage {
     pub blocks: Vec<Block>,
 }
