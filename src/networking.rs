@@ -1,4 +1,3 @@
-
 use crate::blockchain::{Block, Blockchain};
 use std::sync::{Arc, Mutex};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
@@ -148,13 +147,19 @@ async fn handle_https_request(
         if let Ok(chain) = serde_json::from_slice::<Vec<Block>>(&body) {
             let mut bc = blockchain.lock().unwrap();
             if chain.len() > bc.get_chain().len() {
-                bc.storage.blocks = chain;
-                if let Some(addr) = parts.headers.get("host") {
-                    println!("✅ Chain updated via /sync from peer: {}", addr.to_str().unwrap_or("?"));
-                } else {
-                    println!("✅ Chain updated via /sync");
-                }
+            bc.storage.blocks = chain;
+            if let Some(addr) = parts.headers.get("host") {
+                println!("✅ Chain replaced via /sync from peer: {}", addr.to_str().unwrap_or("?"));
+            } else {
+                println!("✅ Chain replaced via /sync");
             }
+        } else {
+            if let Some(addr) = parts.headers.get("host") {
+                println!("ℹ️  Received /sync from peer: {}, but local chain is longer or equal.", addr.to_str().unwrap_or("?"));
+            } else {
+                println!("ℹ️  Received /sync but local chain is longer or equal.");
+            }
+        }
             return Ok(Response::new(Body::from("Chain received")));
         } else {
             return Ok(Response::builder()
