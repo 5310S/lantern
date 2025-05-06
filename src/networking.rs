@@ -13,7 +13,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::StreamExt;
 use std::convert::Infallible;
 use reqwest::Client;
-use local_ip_address::local_ip;
+use crate::utils::get_current_timestamp;
 use serde_json;
 
 static PEERS: &[&str] = &[
@@ -22,6 +22,7 @@ static PEERS: &[&str] = &[
 ];
 
 pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
+
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
@@ -62,6 +63,24 @@ pub async fn connect_to_peers(blockchain: Arc<Mutex<Blockchain>>) {
 }
 
 pub async fn start_https_server(blockchain: Arc<Mutex<Blockchain>>) {
+    // DEBUG: Add 3 fake blocks here instead of inside the async spawn
+    let fake_blocks = {
+        let mut bc = blockchain.lock().unwrap();
+        let mut last = bc.get_chain().last().unwrap().clone();
+        for i in 1..=3 {
+            let new_block = Block {
+                index: last.index + 1,
+                timestamp: get_current_timestamp(),
+                data: format!("fake block {}", i),
+                previous_hash: last.hash.clone(),
+                hash: format!("fakehash-{}", i),
+                nonce: 0,
+            };
+            bc.storage.blocks.push(new_block.clone());
+            last = new_block;
+        }
+    };
+
     let sync_blockchain = blockchain.clone();
     tokio::spawn(async move {
         loop {
@@ -107,6 +126,8 @@ pub async fn start_https_server(blockchain: Arc<Mutex<Blockchain>>) {
 }
 
 fn load_tls_config() -> ServerConfig {
+    use crate::utils::get_current_timestamp;
+    use crate::blockchain::Block;
     use std::path::Path;
 
     if !Path::new("cert.pem").exists() || !Path::new("key.pem").exists() {
