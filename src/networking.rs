@@ -1,5 +1,5 @@
 use crate::blockchain::Blockchain;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -25,7 +25,8 @@ pub fn start_network(blockchain: Arc<Mutex<Blockchain>>) {
         listen_for_connections(blockchain_clone, peers_clone);
     });
 
-    maintain_peer_connections(peers);
+    maintain_peer_connections(Arc::clone(&peers));
+    spawn_chat_input_thread(peers);
 }
 
 fn listen_for_connections(_blockchain: Arc<Mutex<Blockchain>>, peers: SharedPeers) {
@@ -88,12 +89,6 @@ fn maintain_peer_connections(peers: SharedPeers) {
         }
 
         thread::sleep(Duration::from_secs(10));
-
-        let peers_writer = Arc::clone(&peers);
-        let guard = peers_writer.lock().unwrap();
-        for peer in guard.iter() {
-            let _ = peer.stream.try_clone().unwrap().write_all(b"PING\n");
-        }
     });
 }
 
@@ -113,4 +108,26 @@ fn handle_connection(stream: TcpStream) {
             Err(_) => break,
         }
     }
+}
+
+fn spawn_chat_input_thread(peers: SharedPeers) {
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let msg = line.unwrap_or_default();
+            let mut to_remove = vec![];
+
+            let mut peers_guard = peers.lock().unwrap();
+            for (i, peer) in peers_guard.iter_mut().enumerate() {
+                if peer.stream.write_all(format!("CHAT:{}\n", msg).as_bytes()).is_err() {
+                    to_remove.push(i);
+                }
+            }
+
+            // Optionally remove failed peers
+            for &i in to_remove.iter().rev() {
+                peers_guard.remove(i);
+            }
+        }
+    });
 }
