@@ -131,12 +131,17 @@ async fn handle_https_request(
     blockchain: Arc<Mutex<Blockchain>>,
 ) -> Result<Response<Body>, Infallible> {
     if req.method() == Method::POST && req.uri().path() == "/sync" {
-        let body = hyper::body::to_bytes(req.into_body()).await.unwrap();
+        let (parts, body_stream) = req.into_parts();
+        let body = hyper::body::to_bytes(body_stream).await.unwrap();
         if let Ok(chain) = serde_json::from_slice::<Vec<Block>>(&body) {
             let mut bc = blockchain.lock().unwrap();
             if chain.len() > bc.get_chain().len() {
                 bc.storage.blocks = chain;
-                println!("✅ Chain updated via /sync");
+                if let Some(addr) = parts.headers.get("host") {
+                    println!("✅ Chain updated via /sync from peer: {}", addr.to_str().unwrap_or("?"));
+                } else {
+                    println!("✅ Chain updated via /sync");
+                }
             }
             return Ok(Response::new(Body::from("Chain received")));
         } else {
