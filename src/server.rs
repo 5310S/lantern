@@ -21,14 +21,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("📥 {} {} {}", info.method(), info.path(), info.status());
     }));
 
-    let chain_clone = chain.clone();
-    task::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            let c = chain_clone.lock().unwrap();
-            save_chain(&*c);
-        }
-    });
+    let chain_clone_2 = chain.clone();
+task::spawn(async move {
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        crate::networking::sync_with_peers(chain_clone_2.clone()).await;
+    }
+});
+
 
     warp::serve(routes).run(([0, 0, 0, 0], 8080)).await;
     Ok(())
