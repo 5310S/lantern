@@ -1,0 +1,12 @@
+{
+  "blocks": [
+    {
+      "index": 0,
+      "timestamp": 0,
+      "prev_hash": "0",
+      "hash": "9957c080b76e696c8df066302d0ac3656042eeaae15a6c65cd2c6c43aba538a7",
+      "data": "GENESIS",
+      "nonce": 0
+    }
+  ]
+}
