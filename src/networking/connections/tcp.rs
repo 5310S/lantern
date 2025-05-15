@@ -14,6 +14,8 @@ pub async fn connection() -> Result<(), Box<dyn std::error::Error>> {
         "47.17.52.8:8080"
     };
 
+    println!("Connecting to {peer_addr}...");
+
     // (3) Use an async TcpStream connect (e.g. from Tokio)
     let stream = tokio::net::TcpStream::connect(peer_addr).await;
     match stream {
