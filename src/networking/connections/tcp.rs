@@ -9,7 +9,7 @@ pub async fn connection() -> Result<(), Box<dyn std::error::Error>> {
     let my_ip = get_ip().await?;
 
     let peer_addr = if my_ip == "47.17.52.8" {
-        "82.25.86.57:8080"
+        "82.25.86.57:8000"
     } else {
         "47.17.52.8:8080"
     };
